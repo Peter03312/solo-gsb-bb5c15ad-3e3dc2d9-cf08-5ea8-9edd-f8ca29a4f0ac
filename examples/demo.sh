@@ -119,6 +119,38 @@ echo; echo "== 回看 v3：各周期冻结不变 =="
 curl -s "$BASE/versions/3" | pp
 
 # ----------------------------------------------------------------------
+# 周期归属批量纠正（reassign）：现场整理时发现声段记错时钟周期，按采集编号批量移动
+# ----------------------------------------------------------------------
+
+echo; echo "== 为 D1 登记第二周期（后续演示封存后纠正被拒）=="
+curl -s -X POST "$BASE/devices/D1/cycles" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","note":"D1 第二次开机"}' | pp
+
+echo; echo "== 批量纠正：CAP-0101 从 boot-2 移回 default（同设备已登记周期之间，整批原子）=="
+curl -s -X POST "$BASE/segments/reassign-cycle" -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-0101","from_cycle_id":"boot-2","to_cycle_id":"default"}]}' | pp
+
+echo; echo "== 纠正后同编号重传：新周期同内容 -> 幂等；按旧周期 -> 409 冲突 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0101","device_id":"D2","local_start_ms":3000,"local_end_ms":9000,"note":"重启后录制"}' | pp
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0101","device_id":"D2","cycle_id":"boot-2","local_start_ms":3000,"local_end_ms":9000,"note":"重启后录制"}' | pp
+
+echo; echo "== 任一项无效 -> 整批拒绝不改动数据（编号不存在 / 原周期不符 / 目标未登记 / 原=目标）=="
+curl -s -X POST "$BASE/segments/reassign-cycle" -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-0002","from_cycle_id":"default","to_cycle_id":"boot-2"},
+                {"capture_id":"CAP-9999","from_cycle_id":"default","to_cycle_id":"boot-2"}]}' | pp
+curl -s -X POST "$BASE/segments/reassign-cycle" -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-0002","from_cycle_id":"boot-2","to_cycle_id":"default"}]}' | pp
+curl -s -X POST "$BASE/segments/reassign-cycle" -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-0002","from_cycle_id":"default","to_cycle_id":"ghost"}]}' | pp
+curl -s -X POST "$BASE/segments/reassign-cycle" -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-0002","from_cycle_id":"default","to_cycle_id":"default"}]}' | pp
+
+echo; echo "== 发布 v5：之后发布的版本反映新归属（已发布版本保持原快照）=="
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' -d '{"note":"纠正 CAP-0101 周期归属"}' | pp
+
+# ----------------------------------------------------------------------
 # 周期封存（seal）：现场核对完成后冻结单个周期，防止晚到记录改动已确认时间线
 # ----------------------------------------------------------------------
 
@@ -155,6 +187,10 @@ echo; echo "== 封存后该周期声段新增/删除 -> 409 cycle_sealed =="
 curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
   -d '{"capture_id":"CAP-0005","device_id":"D1","local_start_ms":1000,"local_end_ms":2000}' | pp
 curl -s -X DELETE "$BASE/segments/CAP-0001" | pp
+
+echo; echo "== 封存后该周期声段的周期归属纠正 -> 409 cycle_sealed =="
+curl -s -X POST "$BASE/segments/reassign-cycle" -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-0001","from_cycle_id":"default","to_cycle_id":"boot-2"}]}' | pp
 
 echo; echo "== 同内容声段重传 -> 仍按幂等规则返回；异内容 -> 仍按冲突规则处理 =="
 curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \

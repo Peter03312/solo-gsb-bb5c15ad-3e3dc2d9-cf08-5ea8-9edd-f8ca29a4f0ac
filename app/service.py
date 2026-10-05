@@ -12,6 +12,12 @@
 中的内容指纹，在同一事务内核对当前内容且全部声段可定位才生效；封存后
 该周期的锚点/声段变更一律拒绝（同内容声段重传仍按幂等规则返回），
 封存不可撤销。
+
+周期归属批量纠正（reassign，v1.3）：现场整理时发现一批声段被记到错误的
+时钟周期，可按采集编号批量把它们在同一设备的已登记周期之间移动；每项
+声明预期原周期与目标周期，任一项无效即整批拒绝（不改动任何数据）；
+成功后声段起止/备注/创建时间/采集编号不变，内容指纹按新周期重算，
+各声段按目标周期锚点重算定位，相关周期内容指纹随之更新。
 """
 from __future__ import annotations
 
@@ -608,6 +614,167 @@ def delete_segment(db_path: str, capture_id: str):
             _raise_if_sealed(_get_cycle(conn, row["device_id"], row["cycle_id"]))
             conn.execute("DELETE FROM segments WHERE capture_id=?", (capture_id,))
     return 200, {"deleted": capture_id}
+
+
+# -------------------------------------------------------- 周期归属批量纠正
+
+def reassign_segment_cycles(db_path: str, body):
+    """批量纠正声段的周期归属（现场整理时发现声段被记到错误的时钟周期）。
+
+    - 每项 {capture_id, from_cycle_id, to_cycle_id}：把声段从预期原周期移到
+      目标周期；只能在同一设备的已登记周期之间移动（设备归属不变），
+      起止本地毫秒、备注、创建时间与采集编号保持不变；
+    - 任一项无效（编号不存在 / 同批重复 / 原周期与预期不符 / 目标周期未登记 /
+      源或目标周期已封存 / 原周期等于目标周期）-> 整批拒绝，不改动任何数据；
+    - 成功后声段内容指纹按新周期重算（同编号重传仍遵守同内容幂等、异内容
+      冲突规则），返回各声段按目标周期锚点计算的当前定位结果（覆盖不足仍为
+      不可定位），以及相关周期更新后的内容指纹；
+    - 已发布版本保持原快照，之后发布的版本反映新归属。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["items"])
+    items = payload["items"]
+    if not isinstance(items, list):
+        raise ApiError(400, "validation_error", "items 必须是数组",
+                       {"received_type": type(items).__name__})
+    if not items:
+        raise ApiError(400, "validation_error",
+                       "items 不能为空：批量纠正至少包含一项")
+    moves = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"items[{i}] 必须是对象",
+                           {"received_type": type(item).__name__})
+        require_fields(item, ["capture_id", "from_cycle_id", "to_cycle_id"])
+        moves.append({
+            "capture_id": validate_id(item["capture_id"], f"items[{i}].capture_id"),
+            "from_cycle_id": validate_id(item["from_cycle_id"],
+                                         f"items[{i}].from_cycle_id"),
+            "to_cycle_id": validate_id(item["to_cycle_id"], f"items[{i}].to_cycle_id"),
+        })
+    # 同批重复编号 -> 整批拒绝
+    counts: dict[str, int] = {}
+    for m in moves:
+        counts[m["capture_id"]] = counts.get(m["capture_id"], 0) + 1
+    dups = sorted(c for c, n in counts.items() if n > 1)
+    if dups:
+        raise ApiError(409, "reassign_duplicate",
+                       f"同批包含重复的采集编号: {', '.join(dups)}，"
+                       f"每个采集编号每批只能出现一次，整批拒绝",
+                       {"capture_ids": dups})
+    # 原周期等于目标周期的项不构成纠正 -> 整批拒绝
+    same = sorted({m["capture_id"] for m in moves
+                   if m["from_cycle_id"] == m["to_cycle_id"]})
+    if same:
+        raise ApiError(400, "reassign_same_cycle",
+                       f"采集编号 {', '.join(same)} 的原周期与目标周期相同，"
+                       f"不构成纠正，整批拒绝",
+                       {"capture_ids": same})
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            # 1) 任一编号不存在 -> 整批拒绝
+            rows = {}
+            missing = []
+            for m in moves:
+                cid = m["capture_id"]
+                row = conn.execute("SELECT * FROM segments WHERE capture_id=?",
+                                   (cid,)).fetchone()
+                if row is None:
+                    missing.append(cid)
+                else:
+                    rows[cid] = row
+            if missing:
+                raise ApiError(404, "capture_not_found",
+                               f"采集编号不存在: {', '.join(sorted(missing))}，"
+                               f"整批拒绝，不改动任何数据",
+                               {"capture_ids": sorted(missing)})
+            # 2) 原周期与预期不符 -> 整批拒绝
+            mismatches = [
+                {"capture_id": m["capture_id"],
+                 "device_id": rows[m["capture_id"]]["device_id"],
+                 "expected_cycle_id": m["from_cycle_id"],
+                 "actual_cycle_id": rows[m["capture_id"]]["cycle_id"]}
+                for m in moves
+                if rows[m["capture_id"]]["cycle_id"] != m["from_cycle_id"]]
+            if mismatches:
+                raise ApiError(409, "reassign_cycle_mismatch",
+                               f"{len(mismatches)} 项的原周期与预期不符"
+                               f"（声段当前周期与 from_cycle_id 不一致），"
+                               f"整批拒绝，不改动任何数据",
+                               {"mismatches": mismatches})
+            # 3) 目标周期必须在声段所属设备上已登记 -> 否则整批拒绝
+            cycle_rows: dict = {}
+
+            def cycle_of(device_id, cycle_id):
+                key = (device_id, cycle_id)
+                if key not in cycle_rows:
+                    r = conn.execute(
+                        "SELECT device_id, cycle_id, sealed_at FROM cycles "
+                        "WHERE device_id=? AND cycle_id=?", key).fetchone()
+                    cycle_rows[key] = dict(r) if r is not None else None
+                return cycle_rows[key]
+
+            missing_cycles = [
+                {"capture_id": m["capture_id"],
+                 "device_id": rows[m["capture_id"]]["device_id"],
+                 "cycle_id": m["to_cycle_id"]}
+                for m in moves
+                if cycle_of(rows[m["capture_id"]]["device_id"],
+                            m["to_cycle_id"]) is None]
+            if missing_cycles:
+                raise ApiError(404, "cycle_not_found",
+                               f"目标周期未在声段所属设备上登记：只能在同一设备的"
+                               f"已登记周期之间移动，整批拒绝，不改动任何数据",
+                               {"items": missing_cycles})
+            # 4) 源/目标周期已封存 -> 整批拒绝
+            sealed, seen_sealed = [], set()
+            for m in moves:
+                dev = rows[m["capture_id"]]["device_id"]
+                for cyc_id in (m["from_cycle_id"], m["to_cycle_id"]):
+                    cyc = cycle_of(dev, cyc_id)
+                    # 源周期必然已登记（声段提交时校验过，且无删除周期入口）
+                    if (cyc is not None and cyc["sealed_at"] is not None
+                            and (dev, cyc_id) not in seen_sealed):
+                        seen_sealed.add((dev, cyc_id))
+                        sealed.append({"device_id": dev, "cycle_id": cyc_id,
+                                       "sealed_at": cyc["sealed_at"]})
+            if sealed:
+                raise ApiError(409, "cycle_sealed",
+                               f"源/目标周期已封存，周期归属已冻结，"
+                               f"整批拒绝，不改动任何数据",
+                               {"cycles": sealed})
+            # 5) 全部通过：逐条移动（仅改周期归属与内容指纹，其余字段保持不变）
+            for m in moves:
+                row = rows[m["capture_id"]]
+                digest = segment_content_hash(
+                    m["capture_id"], row["device_id"], m["to_cycle_id"],
+                    row["local_start_ms"], row["local_end_ms"], row["note"])
+                conn.execute(
+                    "UPDATE segments SET cycle_id=?, content_hash=? "
+                    "WHERE capture_id=?",
+                    (m["to_cycle_id"], digest, m["capture_id"]))
+            # 6) 按目标周期锚点计算各声段当前定位结果（同事务读取；
+            #    目标周期覆盖不足的声段仍为不可定位）
+            anchors = _anchors_map(conn)
+            projs = sort_projections([
+                project_segment(
+                    {**_row_to_segment(rows[m["capture_id"]]),
+                     "cycle_id": m["to_cycle_id"]},
+                    anchors.get((rows[m["capture_id"]]["device_id"],
+                                 m["to_cycle_id"]), ([], [])))
+                for m in moves])
+            # 7) 相关周期（源+目标）内容指纹随移动更新，一并返回便于核对
+            affected = sorted(
+                {(rows[m["capture_id"]]["device_id"], m["from_cycle_id"])
+                 for m in moves}
+                | {(rows[m["capture_id"]]["device_id"], m["to_cycle_id"])
+                   for m in moves})
+            cycle_fps = [{"device_id": dev, "cycle_id": cyc,
+                          "fingerprint": _cycle_content_fingerprint(conn, dev, cyc)}
+                         for dev, cyc in affected]
+    return 200, {"moved": len(moves), "segments": projs, "cycles": cycle_fps,
+                 "message": "周期归属已批量纠正：声段起止、备注、创建时间与采集编号"
+                            "保持不变，已按目标周期锚点重算定位"}
 
 
 # ---------------------------------------------------------------- 当前时间轴

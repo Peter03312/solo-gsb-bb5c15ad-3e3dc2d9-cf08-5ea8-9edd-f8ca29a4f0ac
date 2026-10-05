@@ -85,6 +85,15 @@ class TimelineClient:
     def delete_segment(self, capture_id: str):
         return self._call("DELETE", f"/segments/{capture_id}")
 
+    # 周期归属批量纠正
+    def reassign_cycles(self, items: list[dict]):
+        """批量纠正声段周期归属：每项 {capture_id, from_cycle_id, to_cycle_id}。
+
+        整批原子：任一项无效（编号不存在/同批重复/原周期不符/目标未登记/
+        源或目标已封存/原周期等于目标周期）即全部拒绝，不改动任何数据。
+        """
+        return self._call("POST", "/segments/reassign-cycle", {"items": items})
+
     # 时间轴与版本
     def timeline(self):
         return self._call("GET", "/timeline/current")
@@ -164,6 +173,26 @@ def main() -> None:
     # 10. 发布 v3：各周期锚点与声段投影原子冻结，文档带 cycle_id / format_rev=2
     show("发布 v3（双周期冻结）", *cli.publish("加入重启周期"))
 
+    # 10.5 现场整理：CAP-0100 实际录在 default 周期（此前误记到 boot-2），
+    #      按采集编号批量纠正周期归属（同一设备的已登记周期之间移动）
+    show("批量纠正周期归属（CAP-0100: boot-2 -> default）",
+         *cli.reassign_cycles([
+             {"capture_id": "CAP-0100", "from_cycle_id": "boot-2",
+              "to_cycle_id": "default"}]))
+    #      纠正后同编号重传：新周期同内容 -> 幂等；按旧周期 -> 409 冲突
+    show("纠正后新周期同内容重传（幂等）",
+         *cli.submit_segment("CAP-0100", "D1", 5000, 20000, note="重启后录制"))
+    show("纠正后按旧周期重传（409 冲突）",
+         *cli.submit_segment("CAP-0100", "D1", 5000, 20000,
+                             note="重启后录制", cycle_id="boot-2"))
+    #      任一项无效（如此处 CAP-9999 不存在）-> 整批拒绝，不改动任何数据
+    show("含不存在编号（整批拒绝）",
+         *cli.reassign_cycles([
+             {"capture_id": "CAP-0001", "from_cycle_id": "default",
+              "to_cycle_id": "boot-2"},
+             {"capture_id": "CAP-9999", "from_cycle_id": "default",
+              "to_cycle_id": "boot-2"}]))
+
     # 11. 现场核对完成：封存 D1 的 default 周期，防止晚到记录改动已确认时间线
     #     周期详情返回内容稳定指纹与封存状态
     _, detail = cli.cycle_detail("D1", "default")
@@ -183,6 +212,11 @@ def main() -> None:
     #     封存后该周期锚点/声段变更一律 409 cycle_sealed
     show("封存后新增锚点（409）", *cli.add_anchor("D1", 30000, 1700000030000))
     show("封存后新声段（409）", *cli.submit_segment("CAP-0005", "D1", 1000, 2000))
+    #     封存后该周期声段的周期归属也不能改 -> 409 cycle_sealed
+    show("封存后批量纠正周期归属（409）",
+         *cli.reassign_cycles([
+             {"capture_id": "CAP-0001", "from_cycle_id": "default",
+              "to_cycle_id": "boot-2"}]))
     #     同内容重传仍按幂等规则返回
     show("封存后同内容重传（幂等）",
          *cli.submit_segment("CAP-0001", "D1", 5000, 20000, note="鸟鸣"))

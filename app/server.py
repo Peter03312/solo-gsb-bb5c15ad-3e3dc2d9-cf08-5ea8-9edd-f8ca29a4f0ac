@@ -57,6 +57,7 @@ def h_root(ctx, body, query):
             "PUT    /devices/{device_id}/anchors            # 锚点更正（按周期整体替换）",
             "DELETE /devices/{device_id}/anchors/{local_ms} # 锚点更正（删除单个，默认 default 周期）",
             "POST   /segments                                      # body 可带 cycle_id，省略=default",
+            "POST   /segments/reassign-cycle           # 批量纠正声段周期归属（整批原子）",
             "GET    /segments                                      # 可加 ?device_id=&cycle_id=",
             "GET    /segments/{capture_id}",
             "DELETE /segments/{capture_id}",
@@ -126,6 +127,10 @@ def h_submit_segment(ctx, body, query):
     return service.submit_segment(ctx.db_path, body)
 
 
+def h_reassign_segment_cycles(ctx, body, query):
+    return service.reassign_segment_cycles(ctx.db_path, body)
+
+
 def h_list_segments(ctx, body, query):
     device_id = query.get("device_id", [None])[0]
     cycle_id = _cycle_query(query)
@@ -174,6 +179,7 @@ ROUTES = [
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),
     ("DELETE", r"^/devices/(?P<device_id>[^/]+)/anchors/(?P<local_ms>[^/]+)$", h_delete_anchor),
     ("POST", r"^/segments$", h_submit_segment),
+    ("POST", r"^/segments/reassign-cycle$", h_reassign_segment_cycles),
     ("GET", r"^/segments$", h_list_segments),
     ("GET", r"^/segments/(?P<capture_id>[^/]+)$", h_get_segment),
     ("DELETE", r"^/segments/(?P<capture_id>[^/]+)$", h_delete_segment),
