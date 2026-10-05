@@ -85,6 +85,11 @@ class TimelineClient:
     def delete_segment(self, capture_id: str):
         return self._call("DELETE", f"/segments/{capture_id}")
 
+    def reassign_cycles(self, items: list[dict]):
+        """批量纠正周期归属：每项 {capture_id, from_cycle_id?, to_cycle_id?}
+        （周期字段省略=default）；任一项无效即整批拒绝，不改动数据。"""
+        return self._call("POST", "/segments/reassign-cycle", {"items": items})
+
     # 时间轴与版本
     def timeline(self):
         return self._call("GET", "/timeline/current")
@@ -189,6 +194,25 @@ def main() -> None:
     #     未封存周期（boot-2）不受影响
     show("未封存周期正常写入",
          *cli.submit_segment("CAP-0101", "D1", 6000, 8000, cycle_id="boot-2"))
+
+    # 12. 现场整理：CAP-0002 实际录于 D2 重启之后，被错记到 default 周期
+    show("登记 D2 周期 boot-2", *cli.register_cycle("D2", "boot-2", note="D2 第二次开机"))
+    show("D2/boot-2 锚点#1", *cli.add_anchor("D2", 0, 1700020000000, cycle_id="boot-2"))
+    show("D2/boot-2 锚点#2", *cli.add_anchor("D2", 60000, 1700020060000, cycle_id="boot-2"))
+    #     批量纠正周期归属：每项携带 采集编号+预期原周期+目标周期，整批原子生效；
+    #     响应返回按目标周期锚点重算的定位结果与相关周期最新内容指纹
+    show("批量纠正周期归属", *cli.reassign_cycles([
+        {"capture_id": "CAP-0002", "from_cycle_id": "default", "to_cycle_id": "boot-2"}]))
+    #     原周期与预期不符 -> 409 cycle_mismatch，整批拒绝不改动
+    show("原周期与预期不符（409）", *cli.reassign_cycles([
+        {"capture_id": "CAP-0002", "from_cycle_id": "default", "to_cycle_id": "boot-2"}]))
+    #     已封存周期（D1/default）不能作为源或目标 -> 409 cycle_sealed
+    show("源周期已封存（409）", *cli.reassign_cycles([
+        {"capture_id": "CAP-0001", "from_cycle_id": "default", "to_cycle_id": "boot-2"}]))
+    #     纠正后按新归属同内容重传 -> 幂等；之后发布的版本反映新归属
+    show("按新归属同内容重传（幂等）",
+         *cli.submit_segment("CAP-0002", "D2", 3000, 9000, cycle_id="boot-2"))
+    show("发布 v4（反映新归属）", *cli.publish("纠正 CAP-0002 周期归属"))
 
 
 if __name__ == "__main__":

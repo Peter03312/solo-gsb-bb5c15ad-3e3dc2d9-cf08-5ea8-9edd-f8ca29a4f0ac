@@ -6,6 +6,7 @@
 - SQLite 单文件存储，WAL 模式；写操作单事务（`BEGIN IMMEDIATE`），发布与更正并发时每个版本仍对应一套完整自洽的锚点+声段快照
 - **时钟周期（cycle，v1.1 新增）**：设备每次重启本地毫秒归零，可按"周期"登记编号；不同周期可复用同一本地毫秒值，锚点递增校验与线性映射**按周期独立执行**，声段只使用所属周期的锚点。旧库启动即自动迁移，**已发布旧版本查询结果完全不变**。
 - **周期封存（seal，v1.2 新增）**：现场核对完成后可封存单台设备的一个周期——封存请求携带周期详情中的内容指纹，在同一事务内核对当前内容、且全部声段可定位才生效；封存后该周期锚点/声段变更一律拒绝，防止晚到记录改动已确认时间线；封存不可撤销。旧库周期默认未封存。
+- **批量纠正周期归属（reassign，v1.3 新增）**：现场整理时发现声段被记到错误的设备时钟周期，可按采集编号批量在同一设备的已登记周期之间移动；每项携带预期原周期与目标周期，任一项无效即整批拒绝、不改动数据；成功后按目标周期锚点重算定位，相关周期内容指纹随之更新。纯新增能力，无表结构变更，旧库可直接升级。
 
 ## 快速开始
 
@@ -79,6 +80,17 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 - **更正的整体性**：一次 `PUT` 锚点更正若涉及任一已封存周期 → **整体拒绝**，其他周期不受影响（不写入）；只更正未封存周期不受影响。
 - 旧库升级后所有周期**默认未封存**；已发布版本与未封存周期的原有行为完全保持。
 
+### 批量纠正周期归属（reassign）
+
+现场整理时，一批声段可能被记到错误的设备时钟周期。`POST /segments/reassign-cycle` 支持按采集编号批量纠正周期归属：
+
+- **请求体**：`{"items": [{"capture_id", "from_cycle_id", "to_cycle_id"}, ...]}`，每项提交采集编号、预期原周期和目标周期；`from_cycle_id` / `to_cycle_id` 省略时按 `default` 处理（与全站约定一致）；`items` 必须是非空数组。
+- **只能同设备移动**：目标周期必须是**该声段所属设备**的已登记周期（他设备同名周期不算）；设备归属、起止本地毫秒、备注、创建时间和采集编号均保持不变，仅周期归属改变。
+- **整批原子**：任一编号不存在（`404 capture_not_found`）、同批重复（`400 duplicate_capture_id`）、原周期与预期不符（`409 cycle_mismatch`）、目标周期未登记（`404 cycle_not_found`）、源/目标周期已封存（`409 cycle_sealed`），或原周期等于目标周期（`400 same_cycle`）时，**整批拒绝且不改动任何数据**。
+- **成功响应（200）**：`segments` 按请求顺序返回各声段**按目标周期锚点计算的当前定位结果**（目标周期覆盖不足时保持 `unlocatable`）；`cycles` 返回相关（源与目标）周期的**最新内容指纹**与声段计数——指纹随归属变化即时更新，周期详情接口可见同一值。
+- **与既有规则共存**：纠正后同编号重传继续遵守同内容幂等、异内容冲突规则（周期计入内容指纹，按新归属同内容重传幂等、按旧周期重传 `409 capture_conflict`）；已发布版本保持原快照，之后发布的版本反映新归属（`changes` 中体现为位移）。
+- **一致性**：批量纠正与锚点更正、封存、版本发布在同一写锁下串行执行，任一时刻库状态完整自洽，不会出现半批生效或撕裂快照。
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -108,6 +120,10 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 封存指纹与当前内容不一致（指纹过期） | `409 seal_fingerprint_stale` |
 | 封存时周期内存在不可定位声段 | `409 seal_unlocatable_segments` |
 | 变更已封存周期的锚点/声段 | `409 cycle_sealed` |
+| 批量纠正：原周期等于目标周期 | `400 same_cycle` |
+| 批量纠正：同批采集编号重复 | `400 duplicate_capture_id` |
+| 批量纠正：原周期与预期不符 | `409 cycle_mismatch` |
+| 批量纠正：采集编号不存在 | `404 capture_not_found` |
 
 ### 幂等与冲突
 
@@ -147,6 +163,7 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | PUT | `/devices/{id}/anchors` | **锚点更正**：按周期整体替换 `{cycle_id?, anchors:[...]}`（原子生效） |
 | DELETE | `/devices/{id}/anchors/{local_ms}?cycle_id=` | **锚点更正**：删除单个锚点（省略周期=default） |
 | POST | `/segments` | 提交声段 `{capture_id, device_id, local_start_ms, local_end_ms, cycle_id?, note?}` |
+| POST | `/segments/reassign-cycle` | **批量纠正周期归属** `{items:[{capture_id, from_cycle_id?, to_cycle_id?}]}`（整批原子生效） |
 | GET | `/segments` / `/segments/{capture_id}` | 声段列表（可加 `?device_id=&cycle_id=`）/ 单个 |
 | DELETE | `/segments/{capture_id}` | 删除声段（下一版体现为"移除"） |
 | GET | `/timeline/current` | 当前时间轴（按现有锚点实时重算，显示周期归属） |
@@ -262,6 +279,55 @@ curl -s -X PUT $BASE/devices/D1/anchors -H 'Content-Type: application/json' \
 # => 409 cycle_sealed（boot-2 也不会被写入）
 ```
 
+### 批量纠正周期归属（现场整理时纠正错记周期）
+
+```bash
+BASE=http://localhost:8000
+
+# 0. 前情：D1/default 已封存（见上节）。登记第三次开机周期并录入锚点
+curl -s -X POST $BASE/devices/D1/cycles -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-3","note":"第三次开机"}'
+curl -s -X POST $BASE/devices/D1/anchors -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-3","local_ms":1000,"utc_ms":1700020000000}'
+curl -s -X POST $BASE/devices/D1/anchors -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-3","local_ms":61000,"utc_ms":1700020060500}'
+
+# 1. 一段本应属于 boot-3 的录音被错记到 boot-2 周期
+curl -s -X POST $BASE/segments -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-2001","device_id":"D1","cycle_id":"boot-2","local_start_ms":5000,"local_end_ms":20000}'
+
+# 2. 批量纠正：每项携带 采集编号 + 预期原周期 + 目标周期，整批原子生效
+curl -s -X POST $BASE/segments/reassign-cycle -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-2001","from_cycle_id":"boot-2","to_cycle_id":"boot-3"}]}'
+# => 200 {"moved":1,
+#         "segments":[{"capture_id":"CAP-2001","device_id":"D1","cycle_id":"boot-3",
+#                      "from_cycle_id":"boot-2","local_start_ms":5000,"local_end_ms":20000,
+#                      "status":"located","utc_start_ms":1700020004033,...}],
+#         "cycles":[{"device_id":"D1","cycle_id":"boot-2","segment_count":1,"fingerprint":"..."},
+#                   {"device_id":"D1","cycle_id":"boot-3","segment_count":1,"fingerprint":"..."}]}
+#    定位结果按目标周期锚点重算（覆盖不足保持 unlocatable）；相关周期指纹随之更新
+
+# 3. 原周期与预期不符 -> 409 cycle_mismatch，整批拒绝不改动（上一步已移到 boot-3）
+curl -s -X POST $BASE/segments/reassign-cycle -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-2001","from_cycle_id":"boot-2","to_cycle_id":"default"}]}'
+
+# 4. 目标周期未登记 -> 404 cycle_not_found；原周期等于目标周期 -> 400 same_cycle；
+#    同批重复 -> 400 duplicate_capture_id；编号不存在 -> 404 capture_not_found
+curl -s -X POST $BASE/segments/reassign-cycle -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-2001","from_cycle_id":"boot-3","to_cycle_id":"ghost"}]}'
+
+# 5. 源/目标周期已封存 -> 409 cycle_sealed（default 已封存，不能作为目标）
+curl -s -X POST $BASE/segments/reassign-cycle -H 'Content-Type: application/json' \
+  -d '{"items":[{"capture_id":"CAP-2001","from_cycle_id":"boot-3","to_cycle_id":"default"}]}'
+
+# 6. 纠正后同编号重传：按新归属同内容 -> 幂等；按旧周期 -> 409 capture_conflict
+curl -s -X POST $BASE/segments -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-2001","device_id":"D1","cycle_id":"boot-3","local_start_ms":5000,"local_end_ms":20000}'
+
+# 7. 之后发布的版本反映新归属（changes 体现位移）；已发布版本保持原快照
+curl -s -X POST $BASE/versions -H 'Content-Type: application/json' -d '{"note":"纠正周期归属"}'
+```
+
 完整演示脚本（覆盖幂等、冲突、越界、排序、版本差异）：
 
 ```bash
@@ -323,14 +389,16 @@ python3 -m unittest discover -s tests -v
 - `tests/test_api.py`（17 个）：锚点严格递增校验、非法时间、起止倒置、幂等/冲突、线性漂移与取整、无法定位、排序规则、版本不可变、位移/新增/移除、以及**更正与发布并发**下快照完整性；
 - `tests/test_cycles.py`（19 个）：周期登记幂等/冲突、默认周期、跨周期复用本地毫秒、各周期独立递增与独立映射、声段仅用所属周期锚点（覆盖不足仍 `unlocatable`）、周期不存在拒绝不写入、采集编号全局唯一且**周期计入内容**、时间轴/新版显示周期归属、发布原子冻结各周期、以及 **v1 旧库在线迁移**（已有数据归 default、旧声段默认周期重传仍幂等、已发布旧版本查询结果逐字段不变、迁移后发布为周期格式）；
 - `tests/test_seal.py`（18 个）：周期详情指纹与封存状态、指纹稳定性与内容敏感性、封存成功返回封存时间与最终指纹、重复封存返回首次结果、封存不可撤销、指纹过期/不可定位声段拒绝且状态不变、封存后锚点与声段写保护、同内容重传幂等与异内容冲突保持既有规则、涉封存周期的更正整体拒绝且其他周期不受影响、与版本发布共存、**旧库迁移后周期默认未封存且可正常封存**。
+- `tests/test_reassign.py`（17 个）：单条/批量（跨设备）纠正成功且身份字段（起止本地毫秒、备注、创建时间、采集编号）保持不变、按目标周期锚点重算定位（覆盖不足保持 `unlocatable`）、相关周期指纹即时更新、编号不存在/同批重复/原周期不符/目标未登记（含他设备同名周期）/源或目标已封存/原周期等于目标周期均**整批拒绝不改动**、纠正后重传遵守同内容幂等与异内容冲突、已发布版本不变且之后版本反映新归属、移出不可定位声段后源周期可封存、**与版本发布并发**下快照归属与投影自洽。
 
-## 升级与数据迁移（v1.0 → v1.1 → v1.2）
+## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
 - `anchors` / `version_anchors` 主键扩展为含 `cycle_id`（整表重建，数据保留）；`segments` / `version_segments` 增加 `cycle_id` 列；
 - 已发布旧版本标记为 `format_rev=1` 且周期列为空，`GET /versions/{n}` 返回结果与升级前完全一致；升级后新发布为 `format_rev=2`；
 - v1.2 起 `cycles` 表增加 `sealed_at` / `seal_fingerprint` 两列，旧库启动时自动补列，**旧周期一律默认未封存**，未封存周期的所有行为与升级前一致。
+- v1.3 新增批量纠正周期归属接口，**无表结构变更**：纠正仅更新 `segments` 行的 `cycle_id` 与内容指纹列，旧库无需任何迁移即可直接使用。
 
 ## 项目结构
 
@@ -344,7 +412,8 @@ app/
 tests/test_api.py      # 端到端测试（原有能力，保持兼容）
 tests/test_cycles.py   # 端到端测试（时钟周期 + 旧库迁移/旧版本不变）
 tests/test_seal.py     # 端到端测试（周期封存 + 旧库默认未封存）
-examples/demo.sh       # curl 调用示例（含周期与封存用法）
-examples/client.py     # Python 客户端示例（含周期与封存用法）
+tests/test_reassign.py # 端到端测试（批量纠正周期归属 + 与发布并发一致性）
+examples/demo.sh       # curl 调用示例（含周期、封存与批量纠正用法）
+examples/client.py     # Python 客户端示例（含周期、封存与批量纠正用法）
 Dockerfile / docker-compose.yml
 ```

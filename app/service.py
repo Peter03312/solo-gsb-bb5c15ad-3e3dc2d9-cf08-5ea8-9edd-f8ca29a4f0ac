@@ -12,6 +12,11 @@
 中的内容指纹，在同一事务内核对当前内容且全部声段可定位才生效；封存后
 该周期的锚点/声段变更一律拒绝（同内容声段重传仍按幂等规则返回），
 封存不可撤销。
+
+批量纠正周期归属（reassign，v1.3）：现场整理时发现声段被记到错误的时钟
+周期，可按采集编号批量把声段在同一设备的已登记周期之间移动；每项携带
+预期原周期与目标周期，任一项无效即整批拒绝、不改动数据；成功后按目标
+周期锚点重算定位，相关周期内容指纹随之更新。
 """
 from __future__ import annotations
 
@@ -608,6 +613,113 @@ def delete_segment(db_path: str, capture_id: str):
             _raise_if_sealed(_get_cycle(conn, row["device_id"], row["cycle_id"]))
             conn.execute("DELETE FROM segments WHERE capture_id=?", (capture_id,))
     return 200, {"deleted": capture_id}
+
+
+# ---------------------------------------------------------------- 批量纠正周期归属
+
+def reassign_segments_cycle(db_path: str, body):
+    """批量纠正声段的周期归属（现场整理时发现声段被记到错误的设备时钟周期）。
+
+    - 每项提交 capture_id、from_cycle_id（预期原周期）、to_cycle_id（目标周期）；
+      周期字段省略时按 default 处理（与全站约定一致）；
+    - 只能在同一设备的已登记周期之间移动：设备归属、起止本地毫秒、note、
+      created_at、采集编号均保持不变，仅周期归属与内容指纹随之更新；
+    - 任一项无效（编号不存在 / 同批重复 / 原周期与预期不符 / 目标周期未登记 /
+      源或目标周期已封存 / 原周期等于目标周期）-> 整批拒绝，不改动任何数据；
+    - 与锚点更正、封存、版本发布在同一写锁下串行；成功后返回各声段按目标周期
+      锚点计算的当前定位结果（覆盖不足保持 unlocatable）及相关周期最新内容指纹。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["items"])
+    items = payload["items"]
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "validation_error", "items 必须是非空数组",
+                       {"received_type": type(items).__name__})
+    # 结构校验（不依赖库状态）：字段、编号合法性、原周期等于目标周期、同批重复
+    parsed: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"items[{i}] 必须是对象")
+        require_fields(item, ["capture_id"])
+        capture_id = validate_id(item["capture_id"], f"items[{i}].capture_id")
+        from_cycle = validate_cycle_id(item.get("from_cycle_id"))
+        to_cycle = validate_cycle_id(item.get("to_cycle_id"))
+        if from_cycle == to_cycle:
+            raise ApiError(400, "same_cycle",
+                           f"items[{i}] 采集编号 {capture_id} 的原周期与目标周期相同"
+                           f"（{from_cycle}），无需移动，该项无效，整批拒绝",
+                           {"index": i, "capture_id": capture_id,
+                            "cycle_id": from_cycle})
+        if capture_id in seen:
+            raise ApiError(400, "duplicate_capture_id",
+                           f"采集编号 {capture_id} 在同批请求中重复出现，整批拒绝",
+                           {"capture_id": capture_id, "index": i})
+        seen.add(capture_id)
+        parsed.append((capture_id, from_cycle, to_cycle))
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            # 依赖库状态的校验全部通过后才写入：任一项失败即回滚，整批不改动
+            plans = []
+            for capture_id, from_cycle, to_cycle in parsed:
+                row = conn.execute("SELECT * FROM segments WHERE capture_id=?",
+                                   (capture_id,)).fetchone()
+                if not row:
+                    raise ApiError(404, "capture_not_found",
+                                   f"采集编号 {capture_id} 不存在，整批拒绝",
+                                   {"capture_id": capture_id})
+                if row["cycle_id"] != from_cycle:
+                    raise ApiError(409, "cycle_mismatch",
+                                   f"采集编号 {capture_id} 当前归属周期 "
+                                   f"{row['cycle_id']}，与预期原周期 {from_cycle} "
+                                   f"不符，整批拒绝",
+                                   {"capture_id": capture_id,
+                                    "expected_from_cycle_id": from_cycle,
+                                    "actual_cycle_id": row["cycle_id"]})
+                # 源周期已封存 -> 拒绝（沿用现有 cycle_sealed 语义）
+                _raise_if_sealed(_get_cycle(conn, row["device_id"], from_cycle))
+                # 目标周期必须是同一设备的已登记周期且未封存
+                _raise_if_sealed(_get_cycle(conn, row["device_id"], to_cycle))
+                plans.append((row, from_cycle, to_cycle))
+            # 逐项改归属：起止本地毫秒、note、created_at、采集编号保持不变，
+            # 内容指纹按含周期口径随新归属重算（重传幂等/冲突规则不受影响）
+            for row, _from, to_cycle in plans:
+                digest = segment_content_hash(
+                    row["capture_id"], row["device_id"], to_cycle,
+                    row["local_start_ms"], row["local_end_ms"], row["note"])
+                conn.execute(
+                    "UPDATE segments SET cycle_id=?, content_hash=? WHERE capture_id=?",
+                    (to_cycle, digest, row["capture_id"]))
+            anchors = _anchors_map(conn)
+            segments = []
+            for row, from_cycle, to_cycle in plans:
+                proj = project_segment(
+                    {"capture_id": row["capture_id"], "device_id": row["device_id"],
+                     "cycle_id": to_cycle,
+                     "local_start_ms": row["local_start_ms"],
+                     "local_end_ms": row["local_end_ms"],
+                     "note": row["note"], "created_at": row["created_at"]},
+                    anchors.get((row["device_id"], to_cycle), ([], [])))
+                proj["from_cycle_id"] = from_cycle
+                segments.append(proj)
+            # 相关周期（源与目标，按首次出现去重）内容指纹随归属变化即时更新
+            affected: list[tuple[str, str]] = []
+            for row, from_cycle, to_cycle in plans:
+                for cyc in (from_cycle, to_cycle):
+                    key = (row["device_id"], cyc)
+                    if key not in affected:
+                        affected.append(key)
+            cycles = []
+            for device_id, cycle_id in affected:
+                cyc_anchors, cyc_segs = _cycle_contents(conn, device_id, cycle_id)
+                cycles.append({
+                    "device_id": device_id, "cycle_id": cycle_id,
+                    "segment_count": len(cyc_segs),
+                    "fingerprint": cycle_fingerprint(device_id, cycle_id,
+                                                     cyc_anchors, cyc_segs)})
+            return 200, {"moved": len(plans), "segments": segments,
+                         "cycles": cycles,
+                         "message": "周期归属已批量纠正，定位结果按目标周期锚点实时重算"}
 
 
 # ---------------------------------------------------------------- 当前时间轴
